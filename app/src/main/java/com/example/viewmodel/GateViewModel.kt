@@ -9,6 +9,7 @@ import com.example.data.repository.SmartRecommendation
 import com.example.network.AiProviderType
 import com.example.network.AiResult
 import com.example.network.AiTutorService
+import com.example.network.auth.TokenManager
 import com.example.service.QuestionEvaluator
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -27,7 +28,8 @@ data class PracticeUiState(
     val isFinished: Boolean = false,
     val score: Float = 0f,
     val correctCount: Int = 0,
-    val incorrectCount: Int = 0
+    val incorrectCount: Int = 0,
+    val isSyncing: Boolean = false
 )
 
 data class TestUiState(
@@ -37,7 +39,7 @@ data class TestUiState(
     val currentIndex: Int = 0,
     val userAnswers: Map<String, String> = emptyMap(),
     val markedForReview: Set<String> = emptySet(),
-    val remainingSeconds: Int = 180 * 60, // 3 hours default for full mock
+    val remainingSeconds: Int = 180 * 60,
     val isTimerRunning: Boolean = false,
     val isSubmitted: Boolean = false,
     val submittedResult: TestSessionEntity? = null
@@ -45,15 +47,30 @@ data class TestUiState(
 
 data class AiChatMessage(
     val id: String = UUID.randomUUID().toString(),
-    val sender: String, // "USER" or "AI"
+    val sender: String,
     val message: String,
     val timestamp: Long = System.currentTimeMillis()
 )
 
+data class AuthState(
+    val isLoggedIn: Boolean = false,
+    val isLoading: Boolean = false,
+    val error: String? = null,
+    val userId: String? = null,
+    val userName: String? = null
+)
+
 class GateViewModel(
     private val repository: GateRepository,
-    private val aiTutorService: AiTutorService
+    private val aiTutorService: AiTutorService,
+    private val tokenManager: TokenManager? = null
 ) : ViewModel() {
+
+    // -------------------------------------------------------------
+    // Auth State
+    // -------------------------------------------------------------
+    private val _authState = MutableStateFlow(AuthState(isLoggedIn = tokenManager?.isLoggedIn() == true))
+    val authState: StateFlow<AuthState> = _authState.asStateFlow()
 
     // -------------------------------------------------------------
     // Global Syllabus & Data
@@ -92,19 +109,89 @@ class GateViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     // -------------------------------------------------------------
+    // Server Sync
+    // -------------------------------------------------------------
+    private val _isSyncing = MutableStateFlow(false)
+    val isSyncing: StateFlow<Boolean> = _isSyncing.asStateFlow()
+
+    init {
+        refreshRecommendation()
+        syncFromServer()
+    }
+
+    fun syncFromServer() {
+        viewModelScope.launch {
+            _isSyncing.value = true
+            try {
+                repository.syncSubjectsFromServer()
+                repository.syncQuestionsFromServer()
+                repository.syncResourcesFromServer()
+            } catch (e: Exception) {
+                // Keep local data, log error
+            } finally {
+                _isSyncing.value = false
+            }
+        }
+    }
+
+    // -------------------------------------------------------------
     // Smart Recommendations & Dashboard Metrics
     // -------------------------------------------------------------
     private val _recommendation = MutableStateFlow<SmartRecommendation?>(null)
     val recommendation: StateFlow<SmartRecommendation?> = _recommendation.asStateFlow()
 
-    init {
-        refreshRecommendation()
-    }
-
     fun refreshRecommendation() {
         viewModelScope.launch {
             _recommendation.value = repository.getSmartRecommendation()
         }
+    }
+
+    // -------------------------------------------------------------
+    // Auth Operations
+    // -------------------------------------------------------------
+    fun login(email: String, password: String) {
+        viewModelScope.launch {
+            _authState.update { it.copy(isLoading = true, error = null) }
+            try {
+                val response = repository.remoteDataSource?.login(email, password)
+                if (response != null) {
+                    tokenManager?.saveTokens(response.access_token, response.user_id, response.email, response.name)
+                    _authState.value = AuthState(
+                        isLoggedIn = true,
+                        userId = response.user_id,
+                        userName = response.name
+                    )
+                    syncFromServer()
+                }
+            } catch (e: Exception) {
+                _authState.update { it.copy(isLoading = false, error = e.message ?: "Login failed") }
+            }
+        }
+    }
+
+    fun register(email: String, password: String, name: String) {
+        viewModelScope.launch {
+            _authState.update { it.copy(isLoading = true, error = null) }
+            try {
+                val response = repository.remoteDataSource?.register(email, password, name)
+                if (response != null) {
+                    tokenManager?.saveTokens(response.access_token, response.user_id, response.email, response.name)
+                    _authState.value = AuthState(
+                        isLoggedIn = true,
+                        userId = response.user_id,
+                        userName = response.name
+                    )
+                    syncFromServer()
+                }
+            } catch (e: Exception) {
+                _authState.update { it.copy(isLoading = false, error = e.message ?: "Registration failed") }
+            }
+        }
+    }
+
+    fun logout() {
+        tokenManager?.clearAll()
+        _authState.value = AuthState(isLoggedIn = false)
     }
 
     // -------------------------------------------------------------
@@ -250,7 +337,7 @@ class GateViewModel(
     }
 
     // -------------------------------------------------------------
-    // Test Engine & Full Exam Simulator
+    // Test Engine
     // -------------------------------------------------------------
     private val _testState = MutableStateFlow(TestUiState())
     val testState: StateFlow<TestUiState> = _testState.asStateFlow()
@@ -348,7 +435,6 @@ class GateViewModel(
                     totalScore += eval.marksAwarded
                     if (eval.isCorrect) correctCount++
 
-                    // Record each attempt to database
                     repository.recordAttempt(
                         question = q,
                         selectedAnswer = eval.normalizedUserAnswer,
@@ -387,7 +473,7 @@ class GateViewModel(
     }
 
     // -------------------------------------------------------------
-    // Curated Resources Directory
+    // Resources
     // -------------------------------------------------------------
     val allResources: StateFlow<List<ResourceEntity>> = repository.allResources
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -439,7 +525,7 @@ class GateViewModel(
     }
 
     // -------------------------------------------------------------
-    // Flashcards & Formula Sheets
+    // Flashcards & Formulas
     // -------------------------------------------------------------
     val allFlashcards: StateFlow<List<FlashcardEntity>> = repository.allFlashcards
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -470,7 +556,7 @@ class GateViewModel(
     }
 
     // -------------------------------------------------------------
-    // Notes Management
+    // Notes
     // -------------------------------------------------------------
     val allNotes: StateFlow<List<NoteEntity>> = repository.allNotes
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -494,7 +580,7 @@ class GateViewModel(
     }
 
     // -------------------------------------------------------------
-    // Study Planner & Focus Timer
+    // Study Planner
     // -------------------------------------------------------------
     val currentDateStr: String = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date())
     val dailyTasks: StateFlow<List<StudyTaskEntity>> = repository.getTasksForDate(currentDateStr)
@@ -538,7 +624,7 @@ class GateViewModel(
         listOf(
             AiChatMessage(
                 sender = "AI",
-                message = "👋 Hello Aspirant! I am your GATE CSE 2027 AI Tutor. Ask me any conceptual question, algorithm proof, shortcut trick, or step-by-step derivation from the GATE syllabus!"
+                message = "Hello! I am your GATE CSE 2027 AI Tutor. Ask me any conceptual question from the GATE syllabus!"
             )
         )
     )
@@ -575,7 +661,7 @@ class GateViewModel(
             )
             val responseText = when (result) {
                 is AiResult.Success -> "[${result.providerName}]\n\n${result.text}"
-                is AiResult.Error -> "⚠️ Connection Error: ${result.message}\n\nYou can switch to the Verified Offline Knowledge Base in Settings or retry."
+                is AiResult.Error -> "Connection Error: ${result.message}\n\nYou can switch to the Verified Offline Knowledge Base in Settings or retry."
             }
             val aiMsg = AiChatMessage(sender = "AI", message = responseText)
             _aiChatMessages.update { it + aiMsg }
@@ -602,7 +688,7 @@ class GateViewModel(
     }
 
     // -------------------------------------------------------------
-    // Profile Updates, Role & Clean Database Reset
+    // Profile & Settings
     // -------------------------------------------------------------
     fun updateProfile(profile: UserProfileEntity) {
         viewModelScope.launch {

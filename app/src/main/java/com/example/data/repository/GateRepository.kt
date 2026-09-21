@@ -3,10 +3,14 @@ package com.example.data.repository
 import com.example.data.dao.*
 import com.example.data.database.AppDatabase
 import com.example.data.model.*
+import com.example.network.RemoteDataSource
+import com.example.network.dto.PaginatedQuestionsResponse
 import com.example.service.QuestionEvaluator
 import com.example.service.SpacedRepetitionService
 import com.example.service.SrsScheduleResult
 import com.example.service.TopicAttentionAssessment
+import com.example.sync.ConnectivityMonitor
+import com.example.sync.SyncManager
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.firstOrNull
 import java.text.SimpleDateFormat
@@ -30,7 +34,10 @@ class GateRepository(
     private val userDao: UserDao,
     private val examDao: ExamDao,
     private val database: AppDatabase,
-    val srsService: SpacedRepetitionService = SpacedRepetitionService()
+    val srsService: SpacedRepetitionService = SpacedRepetitionService(),
+    private val remoteDataSource: RemoteDataSource? = null,
+    private val connectivityMonitor: ConnectivityMonitor? = null,
+    private val syncManager: SyncManager? = null
 ) {
     // Subjects & Topics
     val allSubjects: Flow<List<SubjectEntity>> = subjectDao.getAllSubjects()
@@ -51,6 +58,15 @@ class GateRepository(
 
     suspend fun toggleQuestionBookmark(questionId: String, current: Boolean) {
         questionDao.updateBookmark(questionId, !current)
+        if (connectivityMonitor?.isOnline() == true) {
+            syncManager?.queueOperation(
+                operationType = "UPDATE",
+                entityType = "QUESTION",
+                entityId = questionId,
+                payload = """{"isBookmarked": ${!current}}""",
+                idempotencyKey = "bookmark_${questionId}_${System.currentTimeMillis()}"
+            )
+        }
     }
 
     fun filterQuestions(
@@ -88,10 +104,40 @@ class GateRepository(
         )
         val attemptId = attemptDao.insertAttempt(attempt)
 
+        // Try to submit to server if online
+        if (connectivityMonitor?.isOnline() == true && remoteDataSource != null) {
+            try {
+                remoteDataSource.submitAnswer(
+                    questionId = question.id,
+                    userAnswer = eval.normalizedUserAnswer,
+                    timeTakenSeconds = timeSpentSeconds,
+                    mistakeCategory = resolvedMistake?.name
+                )
+            } catch (e: Exception) {
+                // Queue for later sync if server submission fails
+                syncManager?.queueOperation(
+                    operationType = "SUBMIT_ANSWER",
+                    entityType = "ATTEMPT",
+                    entityId = question.id,
+                    payload = """{"questionId":"${question.id}","answer":"${eval.normalizedUserAnswer}","time":$timeSpentSeconds}""",
+                    idempotencyKey = "attempt_${question.id}_${System.currentTimeMillis()}"
+                )
+            }
+        } else {
+            // Queue for sync when online
+            syncManager?.queueOperation(
+                operationType = "SUBMIT_ANSWER",
+                entityType = "ATTEMPT",
+                entityId = question.id,
+                payload = """{"questionId":"${question.id}","answer":"${eval.normalizedUserAnswer}","time":$timeSpentSeconds}""",
+                idempotencyKey = "attempt_${question.id}_${System.currentTimeMillis()}"
+            )
+        }
+
         // Update User Profile Stats
         userDao.incrementSolvedCounter(if (isCorrect) 1 else 0)
 
-        // Spaced Repetition Scheduling based on user performance & mistake category:
+        // Spaced Repetition Scheduling
         val existingRevision = revisionDao.getRevisionItemForQuestion(question.id)
         val scheduleResult = srsService.calculateNextSchedule(
             existingItem = existingRevision,
@@ -120,7 +166,6 @@ class GateRepository(
                 )
             )
         } else if (!isCorrect || scheduleResult.qualityRating < 4) {
-            // Enter into SRS revision if incorrect or struggled
             revisionDao.upsertRevisionItem(
                 RevisionItemEntity(
                     questionId = question.id,
@@ -137,7 +182,7 @@ class GateRepository(
             )
         }
 
-        // Update Topic Mastery and assess if immediate attention is needed
+        // Update Topic Mastery
         updateTopicMasteryWithAttention(question.topicId, isCorrect, timeSpentSeconds)
 
         return attempt.copy(id = attemptId)
@@ -150,7 +195,6 @@ class GateRepository(
         val accuracy = (newCorrect.toFloat() / newAttempts.toFloat()) * 100f
         val avgTime = ((current.averageTimeSeconds * current.attemptsCount) + timeSpentSeconds) / newAttempts
 
-        // Internal mastery formula: accuracy (65%) + attempts volume (35%)
         val volumeScore = min(100f, (newAttempts.toFloat() / 15f) * 100f)
         val rawMastery = (accuracy * 0.65f) + (volumeScore * 0.35f)
         val level = when {
@@ -162,7 +206,6 @@ class GateRepository(
         }
         val needsRev = rawMastery < 50f || (level == MasteryLevel.WEAK)
 
-        // Evaluate whether topic needs immediate attention via SRS Service
         val allAttemptsForTopic = attemptDao.getAttemptsForTopic(topicId)
         val attentionAssessment = srsService.assessTopicAttention(
             topicId = topicId,
@@ -193,7 +236,7 @@ class GateRepository(
         attemptDao.updateMistakeDetails(attemptId, mistakeCategory, note)
     }
 
-    // Topic Mastery & Immediate Attention
+    // Topic Mastery
     val allTopicMastery: Flow<List<TopicMasteryEntity>> = masteryDao.getAllMastery()
     val weakOrOverdueTopics: Flow<List<TopicMasteryEntity>> = masteryDao.getWeakOrOverdueTopics()
     val topicsNeedingAttention: Flow<List<TopicMasteryEntity>> = masteryDao.getTopicsNeedingImmediateAttention()
@@ -232,7 +275,6 @@ class GateRepository(
     val allFlashcards: Flow<List<FlashcardEntity>> = flashcardDao.getAllFlashcards()
     fun getFlashcardsForSubject(subjectId: String): Flow<List<FlashcardEntity>> = flashcardDao.getFlashcardsForSubject(subjectId)
     suspend fun reviewFlashcard(flashcard: FlashcardEntity, quality: Int) {
-        // SuperMemo-2 SRS algorithm
         val newInterval = when {
             quality < 2 -> 1
             flashcard.intervalDays == 1 -> 3
@@ -263,7 +305,7 @@ class GateRepository(
     suspend fun saveNote(note: NoteEntity) = noteDao.insertNote(note)
     suspend fun deleteNote(note: NoteEntity) = noteDao.deleteNote(note)
 
-    // Study Planner & Focus Timer
+    // Study Planner
     fun getTasksForDate(date: String): Flow<List<StudyTaskEntity>> = studyDao.getTasksForDate(date)
     val allTasks: Flow<List<StudyTaskEntity>> = studyDao.getAllTasks()
     suspend fun updateTaskStatus(taskId: String, completed: Boolean) = studyDao.updateTaskStatus(taskId, completed)
@@ -283,7 +325,7 @@ class GateRepository(
     val recentStudySessions: Flow<List<StudySessionEntity>> = studyDao.getRecentSessions()
     val totalStudyMinutes: Flow<Int?> = studyDao.getTotalStudyMinutes()
 
-    // Test Sessions & Exam Simulator
+    // Test Sessions
     val allTestSessions: Flow<List<TestSessionEntity>> = testDao.getAllTestSessions()
     suspend fun getTestSessionById(id: String): TestSessionEntity? = testDao.getTestSessionById(id)
     suspend fun saveTestSession(session: TestSessionEntity) = testDao.upsertTestSession(session)
@@ -295,7 +337,7 @@ class GateRepository(
     suspend fun updateUserProfile(profile: UserProfileEntity) = userDao.insertUserProfile(profile)
     suspend fun updateUserRole(newRole: String) = userDao.updateUserRole(newRole)
 
-    // Exam Config & Official Schedule Events
+    // Exam Config
     val examConfig: Flow<ExamConfigEntity?> = examDao.getExamConfig()
     val allExamEvents: Flow<List<ExamEventEntity>> = examDao.getAllExamEvents()
     fun getNextUpcomingExamEvent(currentTimeMillis: Long = System.currentTimeMillis()): Flow<ExamEventEntity?> =
@@ -306,21 +348,55 @@ class GateRepository(
         AppDatabase.resetDatabaseToCleanState(database)
     }
 
-    // Generate Adaptive Next Recommendations based on live DB metrics
+    // Sync operations
+    suspend fun syncSubjectsFromServer() {
+        if (connectivityMonitor?.isOnline() != true || remoteDataSource == null) return
+        try {
+            val remoteSubjects = remoteDataSource.getSubjects()
+            subjectDao.insertSubjects(remoteSubjects)
+        } catch (e: Exception) {
+            // Keep local cache
+        }
+    }
+
+    suspend fun syncQuestionsFromServer(subjectId: String? = null, page: Int = 1) {
+        if (connectivityMonitor?.isOnline() != true || remoteDataSource == null) return
+        try {
+            val response = remoteDataSource.getQuestions(subjectId = subjectId, page = page)
+            questionDao.insertQuestions(response.data.map { it.toEntity() })
+        } catch (e: Exception) {
+            // Keep local cache
+        }
+    }
+
+    suspend fun syncResourcesFromServer() {
+        if (connectivityMonitor?.isOnline() != true || remoteDataSource == null) return
+        try {
+            val remoteResources = remoteDataSource.getResources()
+            resourceDao.insertResources(remoteResources)
+        } catch (e: Exception) {
+            // Keep local cache
+        }
+    }
+
+    private fun com.example.network.dto.QuestionDto.toEntity() = com.example.network.mapper.DtoMapper.run {
+        this@toEntity.toEntity()
+    }
+
+    // Generate Adaptive Next Recommendations
     suspend fun getSmartRecommendation(): SmartRecommendation {
         val attentionList = masteryDao.getTopicsNeedingImmediateAttention().firstOrNull().orEmpty()
         val weakList = masteryDao.getWeakOrOverdueTopics().firstOrNull().orEmpty()
         val dueRevisions = revisionDao.getDueRevisionItems(System.currentTimeMillis()).firstOrNull().orEmpty()
 
-        // 1. Critical priority: Topics explicitly flagged for immediate attention (e.g. concept gaps, steep inaccuracy)
         if (attentionList.isNotEmpty()) {
             val urgentTopic = attentionList.first()
             val topic = subjectDao.getTopicById(urgentTopic.topicId)
             val subj = topic?.let { subjectDao.getSubjectById(it.subjectId) }
-            val reasonMsg = urgentTopic.attentionReason ?: "Requires immediate attention based on recent attempt patterns"
+            val reasonMsg = urgentTopic.attentionReason ?: "Requires immediate attention"
             return SmartRecommendation(
                 actionTitle = "Immediate Remediation Needed",
-                targetName = "${subj?.name ?: "GATE"} → ${topic?.name ?: "Topic Focus"}",
+                targetName = "${subj?.name ?: "GATE"} -> ${topic?.name ?: "Topic Focus"}",
                 estimatedMinutes = 20,
                 reason = "FLAGGED: $reasonMsg. Solve remediation PYQs now.",
                 type = RecommendationType.PRACTICE_WEAK,
@@ -335,7 +411,7 @@ class GateRepository(
             val subj = q?.let { subjectDao.getSubjectById(it.subjectId) }
             return SmartRecommendation(
                 actionTitle = "Revise Overdue Mistakes",
-                targetName = "${subj?.name ?: "GATE"} → ${topic?.name ?: "Concept Review"}",
+                targetName = "${subj?.name ?: "GATE"} -> ${topic?.name ?: "Concept Review"}",
                 estimatedMinutes = 20,
                 reason = "You have ${dueRevisions.size} questions pending in your Spaced Repetition queue.",
                 type = RecommendationType.REVISION,
@@ -350,7 +426,7 @@ class GateRepository(
             val subj = topic?.let { subjectDao.getSubjectById(it.subjectId) }
             return SmartRecommendation(
                 actionTitle = "Strengthen Weak Topic",
-                targetName = "${subj?.name ?: "GATE"} → ${topic?.name ?: "Core Concept"}",
+                targetName = "${subj?.name ?: "GATE"} -> ${topic?.name ?: "Core Concept"}",
                 estimatedMinutes = 25,
                 reason = "Your recent accuracy is ${weak.accuracy.roundToInt()}% (below 70% threshold). Solve 5 PYQs to build mastery.",
                 type = RecommendationType.PRACTICE_WEAK,
@@ -361,9 +437,9 @@ class GateRepository(
 
         return SmartRecommendation(
             actionTitle = "High-Yield PYQ Drill",
-            targetName = "Operating Systems → Deadlocks & Resource Allocation",
+            targetName = "Operating Systems -> Deadlocks & Resource Allocation",
             estimatedMinutes = 30,
-            reason = "High-weightage topic (9.5% exam frequency). Master Banker's algorithm and resource safety conditions.",
+            reason = "High-weightage topic (9.5% exam frequency). Master Banker's algorithm.",
             type = RecommendationType.STUDY_NEW,
             relatedTopicId = "OS_DEADLOCK",
             relatedSubjectId = "OS"

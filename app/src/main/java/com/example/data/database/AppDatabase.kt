@@ -4,12 +4,22 @@ import android.content.Context
 import androidx.room.Database
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 import com.example.data.dao.*
 import com.example.data.model.*
+import com.example.sync.PendingOperationEntity
+import com.example.sync.SyncMetadataEntity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+
+val MIGRATION_3_4 = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("CREATE TABLE IF NOT EXISTS `sync_metadata` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `entityType` TEXT NOT NULL, `entityId` TEXT NOT NULL, `serverVersion` INTEGER NOT NULL DEFAULT 0, `localVersion` INTEGER NOT NULL DEFAULT 0, `lastSyncedAt` INTEGER NOT NULL DEFAULT 0, `syncState` TEXT NOT NULL DEFAULT 'SYNCED', `lastError` TEXT)")
+        db.execSQL("CREATE TABLE IF NOT EXISTS `pending_operations` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `operationType` TEXT NOT NULL, `entityType` TEXT NOT NULL, `entityId` TEXT NOT NULL, `payload` TEXT NOT NULL, `createdAt` INTEGER NOT NULL DEFAULT 0, `retryCount` INTEGER NOT NULL DEFAULT 0, `lastAttemptAt` INTEGER, `status` TEXT NOT NULL DEFAULT 'PENDING', `idempotencyKey` TEXT NOT NULL, `errorMessage` TEXT)")
+    }
+}
 
 @Database(
     entities = [
@@ -28,9 +38,11 @@ import kotlinx.coroutines.launch
         TestSessionEntity::class,
         UserProfileEntity::class,
         ExamConfigEntity::class,
-        ExamEventEntity::class
+        ExamEventEntity::class,
+        SyncMetadataEntity::class,
+        PendingOperationEntity::class
     ],
-    version = 3,
+    version = 4,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -48,6 +60,8 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun testDao(): TestDao
     abstract fun userDao(): UserDao
     abstract fun examDao(): ExamDao
+    abstract fun syncMetadataDao(): SyncMetadataDao
+    abstract fun pendingOperationDao(): PendingOperationDao
 
     companion object {
         @Volatile
@@ -60,7 +74,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "gate_cse_database.db"
                 )
-                    .fallbackToDestructiveMigration(dropAllTables = true)
+                    .addMigrations(MIGRATION_3_4)
                     .addCallback(DatabaseCallback(scope))
                     .build()
                 INSTANCE = instance
@@ -84,7 +98,6 @@ abstract class AppDatabase : RoomDatabase() {
                 super.onOpen(db)
                 INSTANCE?.let { database ->
                     scope.launch(Dispatchers.IO) {
-                        // Ensure exam events and config exist even after schema upgrade
                         if (database.examDao().getExamConfigOnce() == null) {
                             database.examDao().insertExamConfig(SeedData.getInitialExamConfig())
                             database.examDao().insertExamEvents(SeedData.getInitialExamEvents())
@@ -106,7 +119,6 @@ abstract class AppDatabase : RoomDatabase() {
             db.examDao().insertExamConfig(SeedData.getInitialExamConfig())
             db.examDao().insertExamEvents(SeedData.getInitialExamEvents())
 
-            // Initialize topic mastery records
             SeedData.getInitialTopics().forEach { topic ->
                 db.masteryDao().upsertMastery(
                     TopicMasteryEntity(
