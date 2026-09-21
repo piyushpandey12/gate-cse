@@ -1,0 +1,6 @@
+{
+  "name": "GATE CSE 2027",
+  "description": "Comprehensive adaptive GATE CSE preparation platform featuring structured subject directory, topicwise PYQs, practice engine, exam simulator, spaced repetition, analytics, and AI tutor.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
