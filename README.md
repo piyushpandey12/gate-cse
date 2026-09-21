@@ -1,22 +1,48 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# GATE CSE 2027 Preparation Platform
 
-# Run and deploy your AI Studio app
+A comprehensive, adaptive GATE Computer Science & Engineering (CSE) preparation web platform rewritten from Android to React, TypeScript, Vite, and Express.
 
-This contains everything you need to run your app locally.
+## Features
 
-View your app in AI Studio: https://ai.studio/apps/74be4a9b-f106-4183-94d6-d13afdc049d3
+- **Syllabus Directory & Weightage Matrix**: Complete coverage of all 10 core GATE CSE subjects, engineering mathematics, and general aptitude.
+- **PYQ Explorer**: Filter previous years' question papers by subject, topic, year (2015–2024), question type (MCQ, MSQ, NAT), and marks.
+- **Practice Mode & Immediate Evaluation**: Interactive question solving with instant evaluation, mark calculation, detailed explanations, shortcut tricks, and trap alerts.
+- **GATE CBT Exam Simulator**: Realistic Computer Based Test (CBT) environment mirroring the official TCS iON GATE exam interface with countdown timer, question palette, review flagging, and marking scheme.
+- **Virtual Scientific Calculator**: Authentic GATE virtual calculator implementation featuring algebraic hierarchy, trigonometric, exponential, and memory functions.
+- **Spaced Repetition System (SRS)**: SuperMemo SM-2 algorithm scheduling reviews for weak and mastered concepts with dynamic interval calculation.
+- **Mistake Journal & Error Categorization**: Systematic logging of errors (conceptual, calculation, silly, time pressure, misread, formula trap) with actionable notes.
+- **Revision Notebook & Formula Handbook**: KaTeX-powered high-yield formula sheets and micro-notes with pinning and search.
+- **Study Planner & Focus Pomodoro**: Daily study checklist, milestone timeline to GATE 2027, and integrated focus timer.
+- **Performance Analytics & Diagnostics**: Accuracy tracking, study time logging, test session metrics, and subject readiness breakdown.
+- **Gemini AI GATE Tutor**: Server-side conversational AI tutor for step-by-step problem breakdowns, counter-examples, and concept explanations.
 
-## Run Locally
+## Tech Stack
 
-**Prerequisites:**  [Android Studio](https://developer.android.com/studio)
+- **Frontend**: React 18, TypeScript, Tailwind CSS v4, Lucide React icons, KaTeX
+- **Backend**: Node.js 22, Express, `@google/genai` SDK
+- **Persistence**: LocalStorage client-side persistence with export and reset support
 
+## Running Locally
 
-1. Open Android Studio
-2. Select **Open** and choose the directory containing this project
-3. Allow Android Studio to fix any incompatibilities as it imports the project.
-4. Create a file named `.env` in the project directory and set `GEMINI_API_KEY` in that file to your Gemini API key (see `.env.example` for an example)
-5. Remove this line from the app's `build.gradle.kts` file: `signingConfig = signingConfigs.getByName("debugConfig")`
-6. Run the app on an emulator or physical device
-7. If you have already published your app in AI Studio, please [request upload key reset](https://support.google.com/googleplay/android-developer/answer/9842756#zippy=%2Crequest-an-upload-key-reset) in Google Play Console.
+1. Install dependencies:
+   ```bash
+   npm install
+   ```
+
+2. Configure environment:
+   ```bash
+   cp .env.example .env
+   # Add your GEMINI_API_KEY to .env for AI Tutor features
+   ```
+
+3. Start development server:
+   ```bash
+   npm run dev
+   ```
+   Open `http://localhost:3000` in your browser.
+
+4. Build for production:
+   ```bash
+   npm run build
+   npm start
+   ```
